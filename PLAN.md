@@ -1,7 +1,7 @@
 # StateLedger — Implementation Plan
 
-**Status:** M1 and M2 complete (ledger core, Git capture, verification capture, freshness classification, SQLite schema v3). M3 not started.
-**Date:** 2026-10-26
+**Status:** M1–M5 complete (ledger, capture/freshness, schema v3, context pack, five-tool stdio MCP server, CLI, demo, local OpenCode/Alan wiring, final hardening). M6 not started.
+**Date:** 2026-10-27
 **Companion docs:** `PROJECT_BRIEF.md`, `README.md`
 
 ---
@@ -12,15 +12,16 @@ Inspected on this machine, not assumed:
 
 | Item | Observed |
 | --- | --- |
-| Workspace | `C:\StateLedger` — empty (0 entries), **not** a Git repository |
+| Workspace (initial observation) | At Phase 1 inspection: empty (0 entries), **not** a Git repository. This is historical; the current repository contains the M1–M5 source, tests, scripts, and docs. |
 | Python | 3.11.3 |
 | pip | 25.1 |
 | uv / uvx | 0.7.19 |
 | Git | 2.43.0.windows.1 |
 | SQLite (stdlib) | 3.40.1; WAL, JSON1, FTS5 available in a temp-DB probe |
-| Pytest | 8.3.4 (system interpreter) |
-| Pydantic | 2.12.5 (system interpreter) |
-| Missing | `mcp` (not installed system-wide), `sqlite3` CLI, `gh`, `rg` |
+| Pytest | 8.3.4 (system interpreter; project `.venv` also used) |
+| Pydantic | 2.12.5 (project `.venv`) |
+| `mcp` | 2.3.0 installed in the project `.venv`; not installed system-wide |
+| Initially missing | `sqlite3` CLI, `gh`, `rg` |
 
 Implications: use `sqlite3` from stdlib (no CLI tooling), use a project venv instead of the system interpreter, and do not depend on `rg`/`gh` in scripts.
 
@@ -60,6 +61,9 @@ Custom-server path, tested with the real engine binary in an **isolated** `XDG_C
 **What is verified:** the bundled engine reads `~/.config/opencode`, connects a local stdio server, and merges user config with Alan's injected config.
 
 **What is not verified:** that a live Alan desktop session picks up a newly added entry without restarting, and any registration path for the hosted cloud agent. Do not claim cloud integration.
+
+**M4 local verification (2026-10-27).** A disposable OpenCode config was written under a temporary XDG_CONFIG_HOME using .venv\Scripts\python.exe -m stateledger.server --repo <temp>. opencode mcp list reported stateledger connected; with Alan's injected config present it also reported lan connected (2 servers). An MCP client session listed exactly the five tools and invoked 
+estore_context. A real opencode run session using lan/deepseek/deepseek-v4.1-flash invoked stateledger_restore_context, returned the pack, made no repository edits, and left the real ~/.config/opencode unchanged. This verifies local engine wiring, not cloud registration.
 
 **Fallbacks, in order:**
 
@@ -108,8 +112,8 @@ C:\StateLedger\
   .gitignore                   # .venv/, .stateledger/, __pycache__/
 src\stateledger\
     __init__.py                # version
-    __main__.py                # CLI: serve | restore | check | list     (M4)
-    server.py                  # MCPServer + 4 tool handlers             (M3)
+    __main__.py                # restore CLI fallback                 (M4)
+    server.py                  # MCPServer + 5 tool handlers             (M3)
     models.py                  # Pydantic v2 contract + read models      (M1/M2)
     store.py                   # SQLite, migrations, append-only writes  (M1/M2)
     gitinfo.py                 # read-only Git capture + diffs           (M2)
@@ -125,11 +129,14 @@ src\stateledger\
     test_store.py
     test_gitinfo.py
     test_evidence.py
-    test_context.py            # M3
-    test_server_stdio.py       # M3, spawns the real server
+    test_context.py            # M3, deterministic pack
+    test_server.py             # M3, tool schemas + stdio restart
+    test_cli.py                # M4, stdout/exit codes
+    test_demo.py               # M4, record -> mutate -> stale -> fresh
+    test_alan_config.py        # M4, isolated registration generation
   scripts\
-    demo.py                    # scripted save → mutate → restore story
-    mcp_smoke.py               # protocol smoke test without Alan
+    demo.py                    # scripted record -> mutate -> restore story
+    alan_smoke.py              # isolated OpenCode registration/tool check
 ```
 
 No `src` layout changes later; no second package. `scripts/` is excluded from the wheel.
@@ -388,7 +395,7 @@ Everything else is insert-only: `tasks`, `sessions` (apart from `last_seen_at`),
 | `payload_sha256` | Computed at write, verified on read | Unchanged |
 | Evidence reads | `get_checkpoint()` payload only | `list_evidence()` + `get_verification_capture()` from normalized rows |
 | Freshness classification | Not implemented | `classify_evidence()` against the captured snapshot |
-| MCP tools / CLI | Not implemented | Not implemented (M3 / M4) |
+| MCP tools / CLI | Not implemented | Five MCP tools (M3) and CLI fallback/demo (M4) implemented |
 
 `record_verification(task_id, VerificationDraft)` returns a `vc_…` capture after snapshotting Git and scope hashes. `append_checkpoint(..., verification_capture_ids=[...])` attaches those captures, copies their data, and performs **no hashing**. `append_checkpoint(..., git=...)` remains an internal override for tests and imports; client payloads cannot set `git` (`extra="forbid"`).
 
@@ -456,32 +463,40 @@ Classification algorithm (`evidence.py`, implemented in M2):
 
 ## 8. Session recovery and history
 
-`restore_context(task_id, repo_root, history=5)` returns a Markdown pack plus structured JSON, ordered by actionability:
+`restore_context(task_id, history=5, repo_root=None)` returns a deterministic Markdown pack plus structured JSON. The server is bound to one repository; `repo_root`, when supplied, must match it. The pack is ordered by actionability:
 
 1. **Goal**, last checkpoint `seq`/timestamp, captured revision, branch, dirty flag.
-2. **Drift warning** — `HEAD` moved since the checkpoint, files changed that the checkpoint did not mention, or the revision is gone.
-3. **Blockers**, then **next actions**.
-4. **Decisions** — newest per `supersedes` chain; superseded entries hidden but retrievable.
-5. **Verification table** — check key, status, freshness, reasons, `ahead_by`, and the re-run command.
-6. **History** — last N checkpoints as `seq · time · goal`, plus deltas since the previous checkpoint (new decisions, resolved blockers, completed steps).
+2. **Drift warnings** — `HEAD` moved (or commit distance unavailable), a dirty working tree, or unavailable Git state at capture/classification.
+3. **Blockers**, then **next actions** from the latest checkpoint.
+4. **Decisions** — normalized rows with superseded entries omitted. Supersession is computed over the full task history, then the newest 5,000 current decisions are shown in checkpoint/position order.
+5. **Verification table** — newest first: check key, original status, freshness, reasons, captured revision, and re-run command for non-fresh rows. The newest 1,000 current rows are shown.
+6. **History** — the last N checkpoints, newest first (`seq`, timestamp, goal).
 
-If no checkpoint exists, the pack is a short "no state found" note with the save command — never an error.
+If no checkpoint exists, the pack is a helpful "no state found" note with repository state and the record/save next steps — never an error.
 
-**Checkpoint history** is append-only per task. Corrections are new checkpoints with `parent_id` pointing at the checkpoint being corrected; nothing is edited in place. `list_checkpoints` and `restore_context` paginate by `seq` descending.
+**Cap reporting.** Evidence and decision caps are applied after supersession filtering. Truncation is reported in `drift[]`, in the Markdown, and in structured `evidence_total`/`evidence_omitted` and `decision_total`/`decision_omitted` fields; a capped report is never presented as complete.
+
+**Checkpoint history** is append-only per task. Corrections are new checkpoints with `parent_id` pointing at the checkpoint being corrected; nothing is edited in place. `list_checkpoints` paginates by `seq` descending; `restore_context` shows the newest `history` checkpoints.
 
 ## 9. MCP tool surface
 
-| Tool | Input (required) | Output |
+The server is created with `--repo` and binds to that repository's ledger. Every tool returns a Pydantic-backed structured result (`structuredContent`) plus JSON text.
+
+| Tool | Input | Output |
 | --- | --- | --- |
-| `record_verification` | `task_id`, `check_key`, `kind`, `command`, `status`, `scope`; optional `exit_code`, `output_excerpt` | `capture_id`, captured commit/coverage, `agent_reported` trust, warnings[] |
-| `save_checkpoint` | `task_id`, `goal`; optional decisions/steps/files/blockers/actions/session_id/`verification_capture_ids` | `checkpoint_id`, `seq`, captured git summary, `warnings[]` |
-| `restore_context` | `task_id` or `repo_root`; optional `history` | `markdown`, `checkpoint`, `evidence_report`, `drift` |
-| `list_checkpoints` | `task_id`; optional `limit`, `before_seq` | `[{seq, id, goal, created_at, evidence_counts}]` |
-| `check_evidence` | `task_id`; optional `include_failed`, `include_superseded` | `[{check_key, status, freshness, reasons, command, ahead_by, capture_id}]` |
+| `record_verification` | required: `task_id`, `check_key`, `kind`, `command`, `status`, `scope` (1–50); optional: `exit_code`, `output_excerpt` | `capture_id`, `task_id`, `check_key`, `status`, `coverage`, `git_commit`, `git_branch`, `git_dirty`, `git_error`, `captured_at`, `trust`, `file_count`, `warnings[]` |
+| `save_checkpoint` | required: `task_id`, `goal`; optional: `decisions`, `completed_steps`, `changed_files`, `blockers`, `next_actions`, `verification_capture_ids`, `session_id`, `parent_id` | `checkpoint_id`, `task_id`, `seq`, `parent_id`, `session_id`, `created_at`, `git`, `verification_count`, `verification_capture_ids`, `warnings[]` |
+| `restore_context` | required: `task_id`; optional: `history` (1–20, default 5), `repo_root` (must match the bound repository) | `markdown`, `checkpoint`, `evidence_report[]`, `drift[]`, `evidence_total`, `evidence_omitted`, `decision_total`, `decision_omitted` |
+| `list_checkpoints` | required: `task_id`; optional: `limit` (1–100, default 20), `before_seq` | `checkpoints[]` with `id`, `task_id`, `seq`, `parent_id`, `goal`, `created_at`, `decision_count`, `evidence_count` |
+| `check_evidence` | required: `task_id`; optional: `include_failed` (default true), `include_superseded` (default false) | `evidence[]` newest first with `evidence_id`, `checkpoint_id`, `capture_id`, `check_key`, `status`, `freshness`, `reasons`, `captured_revision`, `captured_at`, `ahead_by`, `command`, `rerun_command`, `superseded_by`; plus `total`, `returned`, `truncated`, `warnings[]` |
 
-`record_verification` is separate from `save_checkpoint` on purpose: an agent can record a result immediately after running a check, then save a checkpoint later without changing the snapshot.
+`include_failed=false` returns only `passed` rows; `error` is not a pass. `record_verification` is separate from `save_checkpoint` on purpose: an agent records a result immediately after running a check, then saves a checkpoint later without changing the snapshot. The server never executes verification commands.
 
-Tool descriptions state the contract in plain language so an agent can choose them without this document. Every handler validates with Pydantic and returns a compact JSON object; exceptions become MCP tool errors with actionable messages (never stack traces).
+Expected failures (validation, unknown task/capture, invalid limits, repo mismatch) become `ToolError` messages that the SDK returns with `is_error=true`; stack traces stay in stderr logs, not tool output.
+
+### CLI fallback (M4)
+
+python -m stateledger restore --repo <path> --task-id <id> [--history N] opens/initializes the repository ledger, builds the same context pack, and writes only Markdown to stdout. --task-id is required: there is no task-discovery API and the CLI does not invent one. --history defaults to 5 and is limited to 1–20. Exit codes are 0 for success (including no-state), 2 for invalid arguments or task id, and 1 for an unrecoverable repository/database error. Diagnostics go to stderr.
 
 ## 10. Milestones
 
@@ -490,9 +505,9 @@ Tool descriptions state the contract in plain language so an agent can choose th
 | M0 | Phase 1 inspection + plan | This document, brief, README | Docs exist; claims backed by observed output; **no app code** |
 | M1 | Ledger core | `pyproject.toml`, `models.py`, `store.py`, `001_init.sql`, fixtures | Section round trip without data loss; append-only UPDATE/DELETE blocked on checkpoints, decisions and evidence; only documented bookkeeping fields mutable; `seq` strictly increasing; rollback leaves no rows or consumed sequence; migrations idempotent |
 | M2 | Git + evidence | `gitinfo.py`, `evidence.py`, migrations 002–003, tests | Capture/save split: a late checkpoint keeps the original commit and hashes; status stays independent; scope-only never fresh; Git failures non-fatal; self/cross-task supersession blocked at the database |
-| M3 | MCP server | `server.py`, `context.py`, `__main__.py` | SDK client spawns server over stdio: initialize → `tools/list` (5 tools) → record → save → new process → restore; stdout clean |
-| M4 | Demo + Alan wiring | `scripts/demo.py`, `scripts/mcp_smoke.py`, real config entry | Scripted stale-evidence demo passes; isolated-config `opencode mcp list` shows `✓ stateledger`; documented manual step for real config |
-| M5 | Hardening | packaging, perf, docs accuracy | `pytest` green offline; restore < 500 ms at 100 checkpoints; README status table matches reality |
+| M3 | MCP server | `server.py`, `context.py` (complete) | SDK client spawns server over stdio: initialize → `tools/list` (5 tools) → record → save → new process → restore; deterministic context pack; stdout clean |
+| M4 | CLI + demo + Alan wiring | `__main__.py`, `scripts/demo.py`, `scripts/alan_smoke.py` (complete) | CLI prints only the pack with 0/1/2 exit codes; demo shows record → mutate → stale → rerun → fresh; isolated OpenCode config connects, exposes five tools, and a real local agent invokes `restore_context` |
+| M5 | Hardening | packaging and docs accuracy (complete; no dedicated perf benchmark) | CLI UTF-8/exit behavior, demo interpreter parity, clean-wheel install with schema v3, full suite green, docs reconciled |
 | M6 | Stretch (post-core) | optional HTTP transport, UI, search | Only after M4 demo is stable; not part of the hackathon gate |
 
 Sequencing rule: **working MCP server and end-to-end demo before any frontend or vector search.** M6 is explicitly cuttable.
@@ -503,13 +518,17 @@ Sequencing rule: **working MCP server and end-to-end demo before any frontend or
 - **Unit — store (M1/M2, implemented):** migration idempotency (v1 and v2 upgrades to v3), atomic migration rollback, newer-version rejection, full-section round trip, normalized rows mirroring the canonical payload, `seq` monotonicity per task, correction history, append-only UPDATE/DELETE on every table, one-time `superseded_by`, self-link and cross-task link rejection, sessions `last_seen_at`-only updates, normalized evidence reads exposing `superseded_by` and `capture_id`, and an injected mid-write failure leaving no checkpoint rows or consumed sequence.
 - **Unit — git (M2, implemented):** temp repo; clean capture, dirty tree, unborn repo, non-repo, missing path, commit existence/distance, scoped diff and status; timeouts on the first command and on `status` return error snapshots instead of raising. No writes to Git metadata (`GIT_OPTIONAL_LOCKS=0`).
 - **Unit — evidence (M2, implemented):** SHA-256 scope hashing, exclusion of `.git`/`.stateledger`, incomplete coverage for missing/empty/exact-missing scopes, and the §7 matrix: fresh, modified, deleted, unrelated commit, dirty in/out of scope, new file in scope, missing repo, non-repo, rewritten history, `scope_only`, empty recorded file set, failed-stays-failed, failed-can-be-stale, error-stays-error; a `commit_distance` failure with clean diff/status still yields `git_unavailable`.
+- **Unit — context pack (M3, implemented):** deterministic Markdown, goal/Git/blockers/actions, newest-first history limits, no-state guidance, decision supersession, stale-pass warnings, dirty-tree and HEAD-drift warnings, superseded evidence omission, byte-identical repeat builds, and 1,000-evidence / 5,000-decision cap regressions with explicit truncation.
+- **Unit — MCP tools (M3, implemented):** exactly five names/schemas, all five handlers, invalid task ids/scopes/goals, unknown captures, invalid limits/history, repo mismatch, actionable `ToolError` messages, `include_failed`/`include_superseded` filters, and newest-first evidence/truncation metadata.
 - **Regression — capture vs save (M2 review, implemented):** result recorded at A, tree changed to B, checkpoint saved at B; the evidence keeps A's commit and hashes and classifies as `potentially_stale`; a capture taken at B classifies `fresh`; saving with a capture never calls `hash_scope`; unknown, cross-task, duplicate, and >50 capture ids are rejected.
 - **Failure policy — Git (M2 review, implemented):** a raising Git capture is converted to a `capture_error` snapshot, checkpoint saving still succeeds, and classifier Git-query failures produce `git_unavailable` (stale), never fresh.
 - **Integration — store + Git (M2, implemented):** record → attach → classify preserves the original snapshot and status.
-- **Integration — protocol (M3):** spawn the actual server with `mcp.client.stdio`, run `initialize`/`list_tools`/`call_tool`, restart the process against the same DB, and assert the checkpoint survives. This is the proof that the transport works, independent of Alan.
-- **CLI — fallback (M4):** `python -m stateledger restore --repo <tmp>` prints the pack and exits 0 with no MCP client.
+- **Integration — protocol (M3, implemented):** the SDK client spawns the server with `mcp.client.stdio`, initializes, lists exactly five tools, records, saves, terminates the process, starts a fresh process against the same DB, and restores the checkpoint. A raw stdio test asserts every stdout line is a JSON-RPC frame.
+- **CLI — fallback (M4, implemented):** subprocess tests assert stdout contains only the Markdown pack, no-state is exit 0, missing task id/invalid history/invalid task id are exit 2, and a missing repository is exit 1.
+- **Demo (M4, implemented):** `scripts/demo.py` is exercised end to end; tests assert A→B stale, re-check fresh, two checkpoints, preserved old evidence, <90 s, and temp cleanup.
+- **Local wiring (M4, implemented):** config-generation tests assert absolute Python/repo commands; the manual isolated `opencode mcp list` connected, an MCP session listed five tools and invoked `restore_context`, and a real `opencode run` agent invoked `stateledger_restore_context`. The real config is never modified.
+- **Hardening (M5, implemented):** CLI UTF-8 output and 0/1/2 exit behavior, demo records/executes the same interpreter, clean-wheel install and schema-v3 initialization, and documentation reconciliation.
 - **Performance (non-blocking):** 100 checkpoints, `restore_context` p95 < 500 ms locally; failure is a warning, not a demo blocker.
-- **Manual — integration (M4):** add the server to an isolated OpenCode config, run `opencode mcp list`, then repeat against the real config path on this machine. Record the observed output in the PR, not in tests.
 
 Nothing in the suite requires network access. All tests use `tmp_path` and a temp ledger.
 
@@ -522,13 +541,13 @@ Nothing in the suite requires network access. All tests use `tmp_path` and a tem
 | AC3 | A passing check whose scope file is modified after capture becomes `potentially_stale` with reason `file_modified`, while `status` remains `passed` | `test_evidence.py` |
 | AC4 | A failed check remains `status=failed` whether fresh or stale; it is never reported as passing | matrix tests |
 | AC5 | A commit that does not touch the evidence scope leaves it `fresh`, and reports `ahead_by > 0` | matrix test |
-| AC6 | After a full server process restart, `restore_context` returns the prior checkpoint | two-process stdio integration test (M3) |
-| AC7 | `tools/list` exposes exactly the five documented tools with JSON schemas; every call is Pydantic-validated | protocol test (M3) |
+| AC6 | After a full server process restart, `restore_context` returns the prior checkpoint | two-process stdio integration test (implemented) |
+| AC7 | `tools/list` exposes exactly the five documented tools with JSON schemas; every call is Pydantic-validated | protocol/schema tests (implemented) |
 | AC8 | Missing/non-Git repo saves successfully with `git.capture_error` and freshness `unknown`; no crash | `test_gitinfo.py`, `test_evidence.py` |
-| AC9 | Server writes no non-MCP bytes to stdout and leaks no secrets/paths outside the repo in logs | stdout-capture assertion (M3) |
-| AC10 | `pytest` passes offline on Windows with Python 3.11; M1/M2 need only Pydantic, and the pinned `mcp==2.3.0` enters the runtime at M3 | CI/local run |
-| AC11 | CLI fallback prints the same context pack without an MCP client | CLI test (M4) |
-| AC12 | The demo script shows record → save → edit → stale → re-record → fresh in under 90 seconds | `scripts/demo.py` (M4) |
+| AC9 | Server writes no non-MCP bytes to stdout and leaks no secrets/paths outside the repo in logs | raw stdio + SDK integration tests (implemented) |
+| AC10 | `pytest` passes offline on Windows with Python 3.11; M1/M2 need only Pydantic, and M3 enables the pinned `mcp==2.3.0` through the `dev`/`mcp` extras | local suite |
+| AC11 | CLI fallback prints the same context pack without an MCP client, with documented exit codes and stdout-only output | subprocess CLI tests (implemented) |
+| AC12 | The demo script shows record -> mutate -> stale -> re-run -> fresh with preserved old evidence in under 90 seconds | scripts/demo.py + demo test (implemented) |
 | AC13 | Missing, empty, or duplicate scope entries are rejected at validation; coverage is `files` only when capture-time hashing completes, otherwise `scope_only` | `test_models.py`, `test_store.py`, `test_evidence.py` |
 | AC14 | A `scope_only` or otherwise incomplete evidence row can never be classified `fresh` | classifier tests (implemented) |
 | AC15 | Evidence cannot supersede itself or link to evidence in another task, at both the database and store-API layers | `test_store.py` trigger + API tests |
@@ -536,6 +555,13 @@ Nothing in the suite requires network access. All tests use `tmp_path` and a tem
 | AC17 | `record_verification` captures Git state + scope hashes at report time; `append_checkpoint` copies the capture and performs no hashing | `test_append_does_not_hash_the_tree`, capture tests |
 | AC18 | A result captured at A and attached to a checkpoint saved at B keeps A's commit/hashes and is `potentially_stale`; a capture taken at B is `fresh` | `test_late_checkpoint_does_not_recapture_old_result`, `test_capture_after_change_is_fresh` |
 | AC19 | Git capture timeouts/failures do not crash recording or saving, and Git query failures (including `commit_distance` returning `None`) never yield `fresh` | `test_gitinfo.py`, `test_evidence.py` failure tests |
+| AC20 | Evidence reports are ordered newest first, the 1,000-row cap retains the newest relevant rows, and truncation is explicit in totals/warnings | cap regression tests |
+| AC21 | Decision supersession is computed over the full history, then the newest 5,000 current decisions are displayed with truncation reported | decision-cap regression test |
+
+| AC22 | CLI requires --task-id, returns 0 for a no-state pack, 2 for invalid arguments/task id, and 1 for a missing repository | 	ests/test_cli.py |
+| AC23 | The demo uses a disposable repo, runs a real check, shows stale then fresh, preserves old evidence, and cleans up | 	ests/test_demo.py, manual run |
+| AC24 | Isolated OpenCode config connects, exposes exactly five tools, and a real local agent invokes 
+estore_context; real config untouched and cloud not claimed | scripts/alan_smoke.py, manual agent run |
 
 ## 13. Risks
 
@@ -557,24 +583,28 @@ Nothing in the suite requires network access. All tests use `tmp_path` and a tem
 
 ## 14. Exact next milestone
 
-**M1 — Ledger core (complete).** Contract, append-only store, atomic migrations, and focused tests. The M1 model/store subset totals 66 passing tests: 61 from the original review plus supersession, reporting, and migration-upgrade fixes.
+**M1 — Ledger core (complete).** Contract, append-only store, atomic migrations, and focused tests.
 
-**M2 + review fix — Git capture and evidence freshness (complete).** Added read-only Git inspection (`gitinfo.py`), a dedicated `record_verification` capture API, SHA-256 scope hashing, the freshness classifier (`evidence.py`), migrations 002–003, self/cross-task supersession guards, and the normalized evidence read model.
+**M2 + review fix — Git capture and evidence freshness (complete).** Capture-time verification snapshots, freshness classification, migrations 002–003, supersession guards, and normalized evidence reads.
 
-The full suite now runs **106 tests**, all passing offline.
+**M3 — MCP server + context pack (complete).** Five stdio tools with structured output, deterministic Markdown packs, truncation reporting, and a fresh-process restore test.
 
-What is now proven by tests:
+**M4 — CLI, demo, local Alan wiring (complete).**
 
-- Capture and save are separate: a result recorded at A and attached to a checkpoint saved at B keeps A's commit and hashes, and B is `potentially_stale`, never "verified by A".
-- A capture taken at B after the change is `fresh`.
-- `append_checkpoint` never hashes the tree; only `record_verification` does.
-- A save captures the checkpoint's commit with `dirty=False` despite the ledger file living in the repo.
-- Current revision ⇒ `fresh`; modified or deleted file ⇒ `potentially_stale`; unrelated commit ⇒ `fresh` with `ahead_by`; dirty scope ⇒ stale; dirty out of scope ⇒ fresh.
-- Missing repo, non-repo, and rewritten history ⇒ `unknown`; `scope_only` and empty recorded file sets ⇒ `potentially_stale`.
-- `status` (passed/failed/error) is copied untouched; a failed check can be fresh or stale.
-- Git timeouts/failures do not crash capture or saving; classification never produces `fresh` when any Git query fails, including commit distance.
-- Evidence cannot supersede itself or cross tasks at DB or API level; reporting reads `superseded_by` and `capture_id` from normalized tables.
+- `python -m stateledger restore --repo <path> --task-id <id>` prints only the Markdown pack; `--task-id` is required because no task-discovery API exists. Exit codes: 0 success, 2 invalid arguments/task id, 1 unrecoverable repository/database error.
+- `scripts/demo.py` runs the full A→B stale → re-check fresh sequence in a disposable repo. Observed exit 0, internal elapsed 3.08s, temp cleaned.
+- `scripts/alan_smoke.py` writes an isolated OpenCode config using the project Python. OpenCode 1.19.3 reported `stateledger connected` (and `alan connected` when the injected Alan config was present), the MCP session listed exactly five tools and invoked `restore_context`.
+- A real `opencode run` agent (`alan/deepseek/deepseek-v4.1-flash`) invoked `stateledger_restore_context`, returned the context pack, left the disposable repo clean, and did not modify the real `~/.config/opencode`.
 
-Still absent: MCP server, context pack, CLI, demo, frontend, vector search.
+The full suite runs **139 tests**, all passing offline in the project `.venv` (Windows, Python 3.11.3, `mcp==2.3.0`).
 
-**Next after review — M3 — MCP server + context pack.** Wrap the store in five tools over stdio (`record_verification`, `save_checkpoint`, `restore_context`, `list_checkpoints`, `check_evidence`), render the Markdown context pack, and prove a fresh-process restore through an SDK client. Do not start M4 (demo/Alan wiring) or any frontend/vector work until M3 is reviewed.
+What is now proven by tests and observed runs:
+
+- CLI stdout isolation, no-state success, required task id, invalid history/task id, and missing-repository exit codes.
+- Demo state transition, old-evidence preservation, under-90-second runtime, and cleanup.
+- Isolated registration config uses absolute Python/repo paths; local engine connection and five-tool exposure; real agent read-only invocation.
+- All M1–M4 guarantees remain: append-only history, capture-time snapshots, independent status/freshness, no fresh verdict on incomplete coverage or Git failures, newest-first evidence, and decision supersession across full history.
+
+Still absent: M6 stretch work. Cloud Alan custom-MCP registration remains unavailable and is not claimed. No frontend, vector search, semantic search, or HTTP transport.
+
+**M5 — final hardening (complete).** CLI output is UTF-8-safe and keeps the 0/1/2 exit contract; the demo records and executes the same Python interpreter; a clean wheel install initialized schema v3 and ran `restore`; the full suite is green. M6 is not started.
