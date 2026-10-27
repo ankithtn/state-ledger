@@ -287,6 +287,20 @@ class CheckpointSummary(StrictModel):
     evidence_count: int
 
 
+class DecisionRecord(StrictModel):
+    """Normalized decision row, including supersession links."""
+
+    id: str
+    checkpoint_id: str
+    task_id: str
+    checkpoint_seq: Annotated[int, Field(ge=1)]
+    position: int
+    text: NonEmptyText
+    rationale: RationaleText | None = None
+    supersedes_id: str | None = None
+    created_at: datetime
+
+
 class EvidenceFileHash(StrictModel):
     path: Annotated[str, StringConstraints(min_length=1, max_length=MAX_PATH_LENGTH)]
     sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -338,3 +352,12 @@ class EvidenceRecord(StrictModel):
     superseded_by: str | None = None
     trust: str = "agent_reported"
     files: list[EvidenceFileHash] = Field(default_factory=list)
+
+
+class EvidencePage(StrictModel):
+    """Newest-first evidence page with explicit truncation metadata."""
+
+    items: list[EvidenceRecord] = Field(default_factory=list)
+    total: int = 0
+    limit: int
+    truncated: bool = False

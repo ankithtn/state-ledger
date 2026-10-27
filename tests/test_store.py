@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from stateledger.models import CheckpointDraft, EvidenceInput
+from stateledger.models import CheckpointDraft, DecisionInput, EvidenceInput
 from stateledger.store import (
     CheckpointNotFound,
     LedgerError,
@@ -406,6 +406,39 @@ def test_list_checkpoints_validates_limit(store):
         store.list_checkpoints("task-a", limit=101)
     with pytest.raises(ValueError):
         store.list_checkpoints("task-a", before_seq=0)
+
+
+def test_list_decisions_returns_normalized_order_and_links(store):
+    first = store.append_checkpoint(
+        "task-a",
+        CheckpointDraft(
+            goal="First",
+            decisions=[DecisionInput(text="Approach Alpha", rationale="Why A")],
+        ),
+    )
+    second = store.append_checkpoint(
+        "task-a",
+        CheckpointDraft(
+            goal="Second",
+            decisions=[
+                DecisionInput(
+                    text="Approach Beta",
+                    supersedes_id=first.decisions[0].id,
+                )
+            ],
+        ),
+    )
+
+    decisions = store.list_decisions("task-a")
+
+    assert [
+        (item.checkpoint_seq, item.text, item.supersedes_id) for item in decisions
+    ] == [
+        (1, "Approach Alpha", None),
+        (2, "Approach Beta", first.decisions[0].id),
+    ]
+    assert decisions[1].checkpoint_id == second.id
+    assert store.list_decisions("missing-task") == []
 
 
 # ------------------------------------------------------------------ history

@@ -37,7 +37,10 @@ def test_capture_clean_repository(git_repo):
 
     assert snapshot.capture_error is None
     assert snapshot.commit == git_repo.head()
-    assert snapshot.branch in {"main", "master"}
+    assert snapshot.branch == "main"
+    assert (
+        git_repo.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "main"
+    )
     assert snapshot.dirty is False
     assert snapshot.repo_root
     assert snapshot.captured_at is not None

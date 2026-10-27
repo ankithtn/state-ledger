@@ -33,8 +33,11 @@ from .models import (
     Checkpoint,
     CheckpointDraft,
     CheckpointSummary,
+    DecisionRecord,
     EvidenceFileHash,
+    EvidencePage,
     EvidenceRecord,
+    EvidenceStatus,
     GitSnapshot,
     PersistedDecision,
     PersistedEvidence,
@@ -828,12 +831,33 @@ class LedgerStore:
         task_id: str | None = None,
         checkpoint_id: str | None = None,
         include_superseded: bool = True,
+        statuses: Sequence[EvidenceStatus] | None = None,
         limit: int = 500,
     ) -> list[EvidenceRecord]:
-        """Read evidence from normalized tables, including ``superseded_by``.
+        """Newest-first evidence rows. See ``list_evidence_page`` for truncation."""
 
-        This is the reporting path. ``get_checkpoint()`` returns the immutable
-        payload and deliberately does not expose mutable supersession state.
+        return self.list_evidence_page(
+            task_id=task_id,
+            checkpoint_id=checkpoint_id,
+            include_superseded=include_superseded,
+            statuses=statuses,
+            limit=limit,
+        ).items
+
+    def list_evidence_page(
+        self,
+        *,
+        task_id: str | None = None,
+        checkpoint_id: str | None = None,
+        include_superseded: bool = True,
+        statuses: Sequence[EvidenceStatus] | None = None,
+        limit: int = 500,
+    ) -> EvidencePage:
+        """Read the newest evidence rows plus the total matching count.
+
+        Ordering is checkpoint sequence descending, then position descending, so
+        a capped page contains the newest relevant rows. Supersession/status
+        filters are applied before LIMIT and before counting.
         """
 
         self._require_initialized()
@@ -854,9 +878,30 @@ class LedgerStore:
             params.append(checkpoint_id)
         if not include_superseded:
             conditions.append("e.superseded_by IS NULL")
+        if statuses is not None:
+            status_values = tuple(statuses)
+            if not status_values or any(
+                status not in {"passed", "failed", "error"}
+                for status in status_values
+            ):
+                raise ValueError("statuses must contain passed/failed/error values")
+            placeholders = ",".join("?" for _ in status_values)
+            conditions.append(f"e.status IN ({placeholders})")
+            params.extend(status_values)
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
 
         with self._connect() as conn:
+            total = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM evidence e
+                    JOIN checkpoints c ON c.id = e.checkpoint_id
+                    {where}
+                    """,
+                    tuple(params),
+                ).fetchone()[0]
+            )
             rows = conn.execute(
                 f"""
                 SELECT e.id, e.checkpoint_id, e.capture_id, c.task_id,
@@ -867,7 +912,7 @@ class LedgerStore:
                 FROM evidence e
                 JOIN checkpoints c ON c.id = e.checkpoint_id
                 {where}
-                ORDER BY c.seq, e.position
+                ORDER BY c.seq DESC, e.position DESC
                 LIMIT ?
                 """,
                 (*params, limit),
@@ -892,7 +937,7 @@ class LedgerStore:
                         )
                     )
 
-        return [
+        items = [
             EvidenceRecord(
                 id=row["id"],
                 checkpoint_id=row["checkpoint_id"],
@@ -912,6 +957,58 @@ class LedgerStore:
                 superseded_by=row["superseded_by"],
                 trust=row["trust"],
                 files=files_by_evidence.get(row["id"], []),
+            )
+            for row in rows
+        ]
+        return EvidencePage(
+            items=items,
+            total=total,
+            limit=limit,
+            truncated=total > len(items),
+        )
+
+    def list_decisions(
+        self, task_id: str, *, limit: int | None = None
+    ) -> list[DecisionRecord]:
+        """Read decisions ordered by checkpoint and position.
+
+        ``limit=None`` reads the full task history, which callers must use when
+        supersession links can point beyond a display cap.
+        """
+
+        self._require_initialized()
+        task_id = validate_task_id(task_id)
+        if limit is not None and not 1 <= limit <= 10000:
+            raise ValueError("limit must be between 1 and 10000 or None")
+
+        sql = """
+            SELECT d.id, d.checkpoint_id, c.task_id, c.seq AS checkpoint_seq,
+                   d.position, d.text, d.rationale, d.supersedes_id,
+                   d.created_at
+            FROM decisions d
+            JOIN checkpoints c ON c.id = d.checkpoint_id
+            WHERE c.task_id = ?
+            ORDER BY c.seq, d.position
+        """
+        params: tuple[object, ...] = (task_id,)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (task_id, limit)
+
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        return [
+            DecisionRecord(
+                id=row["id"],
+                checkpoint_id=row["checkpoint_id"],
+                task_id=row["task_id"],
+                checkpoint_seq=row["checkpoint_seq"],
+                position=row["position"],
+                text=row["text"],
+                rationale=row["rationale"],
+                supersedes_id=row["supersedes_id"],
+                created_at=row["created_at"],
             )
             for row in rows
         ]

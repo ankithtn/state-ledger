@@ -20,7 +20,7 @@ import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Any, Literal, Sequence
 
 from .gitinfo import (
     changed_paths,
@@ -197,22 +197,52 @@ def _verdict(
     )
 
 
+def _cached(
+    cache: dict[tuple[Any, ...], Any] | None,
+    key: tuple[Any, ...],
+    compute,
+):
+    if cache is None:
+        return compute()
+    if key not in cache:
+        cache[key] = compute()
+    return cache[key]
+
+
 def classify_evidence(
-    evidence: EvidenceRecord, repo_root: str | Path
+    evidence: EvidenceRecord,
+    repo_root: str | Path,
+    *,
+    cache: dict[tuple[Any, ...], Any] | None = None,
 ) -> EvidenceVerdict:
-    """Classify relevance of a recorded result against the current repository."""
+    """Classify relevance of a recorded result against the current repository.
+
+    ``cache`` is an optional per-batch cache for Git/hash lookups. It lets a
+    context pack or evidence report classify many rows against one repository
+    snapshot without spawning the same Git commands per row.
+    """
 
     root = Path(repo_root)
     if not root.is_dir():
         return _verdict(evidence, "unknown", ["repo_missing"], None)
-    if not is_git_repository(root):
+
+    root_key = str(root)
+    if not _cached(cache, ("git_repo", root_key), lambda: is_git_repository(root)):
         return _verdict(evidence, "unknown", ["not_a_git_repository"], None)
     if not evidence.git_commit:
         return _verdict(evidence, "unknown", ["no_revision"], None)
-    if not commit_exists(root, evidence.git_commit):
+    if not _cached(
+        cache,
+        ("commit_exists", root_key, evidence.git_commit),
+        lambda: commit_exists(root, evidence.git_commit),
+    ):
         return _verdict(evidence, "unknown", ["history_rewritten"], None)
 
-    ahead_by = commit_distance(root, evidence.git_commit)
+    ahead_by = _cached(
+        cache,
+        ("distance", root_key, evidence.git_commit),
+        lambda: commit_distance(root, evidence.git_commit),
+    )
     distance_reasons = ["git_unavailable"] if ahead_by is None else []
 
     # Coverage precondition: without a complete recorded file set, a pass is
@@ -225,7 +255,12 @@ def classify_evidence(
             ahead_by,
         )
 
-    current = hash_scope(root, evidence.scope)
+    scope = tuple(evidence.scope)
+    current = _cached(
+        cache,
+        ("hash_scope", root_key, scope),
+        lambda: hash_scope(root, evidence.scope),
+    )
     reasons: set[str] = set(distance_reasons)
 
     recorded = {item.path: item.sha256 for item in evidence.files}
@@ -240,13 +275,21 @@ def classify_evidence(
     if not current.complete:
         reasons.add("coverage_incomplete")
 
-    changed = changed_paths(root, evidence.git_commit, evidence.scope)
+    changed = _cached(
+        cache,
+        ("changed", root_key, evidence.git_commit, scope),
+        lambda: changed_paths(root, evidence.git_commit, evidence.scope),
+    )
     if changed is None:
         reasons.add("git_unavailable")
     elif changed:
         reasons.add("commit_touched_scope")
 
-    dirty = uncommitted_paths(root, evidence.scope)
+    dirty = _cached(
+        cache,
+        ("dirty", root_key, scope),
+        lambda: uncommitted_paths(root, evidence.scope),
+    )
     if dirty is None:
         reasons.add("git_unavailable")
     elif dirty:
