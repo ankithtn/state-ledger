@@ -1,6 +1,6 @@
 # StateLedger — Project Brief
 
-**Status:** Phase 1 brief (approved); Phase 2 M1 and M2 implemented (ledger core, Git capture, freshness). See `README.md` for current state.
+**Status:** Phase 1 brief (approved); Phase 2 M1–M5 implemented (ledger, Git/evidence capture, context pack, five-tool MCP server, CLI, demo, local OpenCode wiring, final hardening). M6 not started. See `README.md` for current state.
 **Date:** 2026-10-26
 **Event:** OpenFire Hackathon
 

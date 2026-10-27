@@ -13,9 +13,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# M3 adds the MCP server. M1 does not import or run it.
+# M3 server. Keep the verified SDK version pinned.
 mcp = ["mcp==2.3.0"]
-dev = ["pytest>=8.3"]
+dev = ["pytest>=8.3", "mcp==2.3.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
